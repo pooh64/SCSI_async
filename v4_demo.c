@@ -54,7 +54,7 @@ int v4_read_capacity16(int fd, struct capacity16 *cap)
 	*((uint32_t*) &cdb[10]) = bswap_32(sizeof(data));
 
 	struct sg_io_v4 hdr = {
-		.guard			= 'Q',	/* v4 */
+		.guard			= 'Q',
 		.request_len		= sizeof(cdb),
 		.request		= (uintptr_t) cdb,
 		.din_xfer_len		= sizeof(data),
@@ -105,41 +105,38 @@ static inline int rand_ranged(int min, int max)
 }
 
 struct async_info {
-	uint8_t 	 	 cdb_len;
 	int 		 	 sg_fd;
 	int			 status;
 	struct capacity16	*cap;
 	struct sg_io_v4 	*ctl;
-	uint8_t			*data_buf;
 } g_async_info;
 
 void async_handler(int sig)
 {
-	int 			 sg_fd		= g_async_info.sg_fd;
-	struct capacity16	*cap		= g_async_info.cap;
-	struct sg_io_v4		*ctl		= g_async_info.ctl;
-	uint8_t			 cdb_len	= g_async_info.cdb_len;
-	struct sg_io_v4		*req_arr 	= (void*) ctl->dout_xferp;
-	struct sg_io_v4		*resp_arr	= (void*) ctl->din_xferp;
-	uint8_t			*cdb_arr	= (void*) ctl->request;
-	uint8_t			*data_buf	= g_async_info.data_buf;
+	int 			 sg_fd	 = g_async_info.sg_fd;
+	struct capacity16	*cap	 = g_async_info.cap;
+	struct sg_io_v4		*ctl	 = g_async_info.ctl;
+	struct sg_io_v4		*req_arr = (void*) ctl->dout_xferp;
 
+	/* Receive requests */
 	int ret = ioctl(sg_fd, SG_IORECEIVE, ctl);
 	if (ret < 0 || (errno = ctl->spare_out)) {
 		perror("ioctl");
 		goto err_handler;
 	}
 
+	/* Immediately reinitialize received requests */
 	int n_received = ctl->din_resid;
 	ctl->request_len = cdb_len * n_received;
 	ctl->dout_xfer_len = sizeof(struct sg_io_v4) * n_received;
 	for (int i = 0; i < n_received; i++) {
-		/* int i = resp_arr[n];  Identify request */
-		v4_init_hdr_read16(req_arr + i, cdb_arr + cdb_len * i,
+		/* int i = req_arr[n].usr_ptr;  Identify request  */
+		v4_init_hdr_read16(req_arr + i, (void*) req_arr[i].request,
 			rand_ranged(cap->lba_min, cap->lba_max),
-			1, data_buf + cap->lb_len * i, cap->lb_len);
+			1, (void*) req_arr[i].din_xferp, cap->lb_len);
 	}
 
+	/* Send requests back */
 	ret = ioctl(sg_fd, SG_IOSUBMIT, ctl);
 	if (ret < 0 || (errno = ctl->spare_out)) {
 		perror("ioctl");
@@ -153,12 +150,14 @@ err_handler:
 
 int v4_async_demo(int sg_fd, struct capacity16 *cap, int n_req)
 {
+	/* Buffers for read16 */
 	uint8_t *data_buf = malloc((size_t) n_req * cap->lb_len);
 	if (!data_buf) {
 		perror("malloc");
 		goto handle_err0;
 	}
 
+	/* SCSI-cmd array */
 	uint8_t cdb_len = 16;
 	uint32_t cdb_arr_len = n_req * cdb_len;
 	uint8_t *cdb_arr = malloc(cdb_arr_len);
@@ -167,6 +166,7 @@ int v4_async_demo(int sg_fd, struct capacity16 *cap, int n_req)
 		goto handle_err1;
 	}
 
+	/* SG-v4 requests array */
 	uint32_t req_arr_len = n_req * sizeof(struct sg_io_v4);
 	struct sg_io_v4 *req_arr = malloc(req_arr_len);
 	if (!req_arr) {
@@ -174,45 +174,40 @@ int v4_async_demo(int sg_fd, struct capacity16 *cap, int n_req)
 		goto handle_err2;
 	}
 
-	uint32_t resp_arr_len = n_req * sizeof(struct sg_io_v4);
-	struct sg_io_v4 *resp_arr = malloc(resp_arr_len);
-	if (!resp_arr) {
-		perror("malloc");
-		goto handle_err3;
-	}
-
-	struct sg_io_v4 ctl;
 	for (int i = 0; i < n_req; i++) {
+		/* Random block read16 */
 		v4_init_hdr_read16(req_arr + i, cdb_arr + cdb_len * i,
 				   rand_ranged(cap->lba_min, cap->lba_max),
 				   1, data_buf + cap->lb_len * i, cap->lb_len);
 		req_arr[i].usr_ptr = i;
 	}
 
+	/* SGv4 control object */
+	struct sg_io_v4 ctl;
+
 	memset(&ctl, 0, sizeof(ctl));
 
+	/* Build control object for submit/receive */
 	ctl.guard		= 'Q';
 	ctl.request		= (uintptr_t) cdb_arr;
 	ctl.request_len		= cdb_arr_len;
 	ctl.dout_xferp		= (uintptr_t) req_arr;
 	ctl.dout_xfer_len	= req_arr_len;
-	ctl.din_xferp		= (uintptr_t) resp_arr;
-	ctl.din_xfer_len	= resp_arr_len;
+	ctl.din_xferp		= (uintptr_t) req_arr;
+	ctl.din_xfer_len	= req_arr_len;
 	ctl.flags		= SGV4_FLAG_MULTIPLE_REQS | SGV4_FLAG_IMMED;
 
+	/* Set handler */
 	int signum = SIGRTMIN + 1;
 	struct sigaction async_act = { .sa_handler = async_handler };
 	if (sigaction(signum, &async_act, NULL) < 0) {
 		perror("sigaction");
 		goto handle_err0;
 	}
-
 	g_async_info.sg_fd	= sg_fd;
 	g_async_info.cap	= cap;
 	g_async_info.ctl	= &ctl;
-	g_async_info.cdb_len	= cdb_len;
 	g_async_info.status	= 0;
-	g_async_info.data_buf	= data_buf;
 
 	int flags = fcntl(sg_fd, F_GETFL, NULL);
 	fcntl(sg_fd, F_SETFL, flags | O_ASYNC);
