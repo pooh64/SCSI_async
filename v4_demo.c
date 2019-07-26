@@ -104,6 +104,27 @@ static inline int rand_ranged(int min, int max)
 	return rand() % (max - min) + min;
 }
 
+int fd_enable_async_rt(int fd, int rt_sig)
+{
+	int flags = fcntl(fd, F_GETFL, NULL);
+	if (flags == -1)
+		goto handle_err0;
+
+	if (fcntl(fd, F_SETFL, flags | O_ASYNC) < 0)
+		goto handle_err0;
+
+	if (fcntl(fd, F_SETSIG, rt_sig) < 0)
+		goto handle_err1;
+
+	return 0;
+
+handle_err1:
+	fcntl(fd, F_SETFL, flags);
+handle_err0:
+	perror("fcntl");
+	return -1;
+}
+
 struct async_info {
 	int 		 	 sg_fd;
 	int			 status;
@@ -118,39 +139,45 @@ void async_handler(int sig)
 	struct sg_io_v4		*ctl	 = g_async_info.ctl;
 	struct sg_io_v4		*req_arr = (void*) ctl->dout_xferp;
 
-	/* Receive requests */
+	/* Receive some requests */
 	int ret = ioctl(sg_fd, SG_IORECEIVE, ctl);
 	if (ret < 0 || (errno = ctl->spare_out)) {
 		perror("ioctl");
-		goto err_handler;
+		goto handle_err;
 	}
 
-	/* Immediately reinitialize received requests */
+	/* Reinitialize some request array entries */
 	int n_received = ctl->din_resid;
-	ctl->request_len = cdb_len * n_received;
-	ctl->dout_xfer_len = sizeof(struct sg_io_v4) * n_received;
+
 	for (int i = 0; i < n_received; i++) {
-		/* int i = req_arr[n].usr_ptr;  Identify request  */
+		int n = req_arr[i].usr_ptr; /* Identify received request */
+		printf_log("RECEIVED: req[%d]\n", n);
+
 		v4_init_hdr_read16(req_arr + i, (void*) req_arr[i].request,
 			rand_ranged(cap->lba_min, cap->lba_max),
 			1, (void*) req_arr[i].din_xferp, cap->lb_len);
+
+		req_arr[i].usr_ptr = i;
 	}
 
-	/* Send requests back */
+	/* Submit new read16 requests */
+	ctl->request_len   = n_received * 16;
+	ctl->dout_xfer_len = n_received * sizeof(struct sg_io_v4);
+
 	ret = ioctl(sg_fd, SG_IOSUBMIT, ctl);
 	if (ret < 0 || (errno = ctl->spare_out)) {
 		perror("ioctl");
-		goto err_handler;
+		goto handle_err;
 	}
 
 	return;
-err_handler:
+handle_err:
 	g_async_info.status = -1;
 }
 
 int v4_async_demo(int sg_fd, struct capacity16 *cap, int n_req)
 {
-	/* Buffers for read16 */
+	/* Buffers for data */
 	uint8_t *data_buf = malloc((size_t) n_req * cap->lb_len);
 	if (!data_buf) {
 		perror("malloc");
@@ -182,12 +209,9 @@ int v4_async_demo(int sg_fd, struct capacity16 *cap, int n_req)
 		req_arr[i].usr_ptr = i;
 	}
 
-	/* SGv4 control object */
+	/* Build sg v4 control object */
 	struct sg_io_v4 ctl;
-
 	memset(&ctl, 0, sizeof(ctl));
-
-	/* Build control object for submit/receive */
 	ctl.guard		= 'Q';
 	ctl.request		= (uintptr_t) cdb_arr;
 	ctl.request_len		= cdb_arr_len;
@@ -197,38 +221,36 @@ int v4_async_demo(int sg_fd, struct capacity16 *cap, int n_req)
 	ctl.din_xfer_len	= req_arr_len;
 	ctl.flags		= SGV4_FLAG_MULTIPLE_REQS | SGV4_FLAG_IMMED;
 
-	/* Set handler */
+	/* Set handler, enable async */
 	int signum = SIGRTMIN + 1;
 	struct sigaction async_act = { .sa_handler = async_handler };
 	if (sigaction(signum, &async_act, NULL) < 0) {
 		perror("sigaction");
-		goto handle_err0;
+		goto handle_err3;
 	}
 	g_async_info.sg_fd	= sg_fd;
 	g_async_info.cap	= cap;
 	g_async_info.ctl	= &ctl;
 	g_async_info.status	= 0;
 
-	int flags = fcntl(sg_fd, F_GETFL, NULL);
-	fcntl(sg_fd, F_SETFL, flags | O_ASYNC);
-	fcntl(sg_fd, F_SETSIG, signum);
+	if (fd_enable_async_rt(sg_fd, signum) < 0)
+		goto handle_err3;
 
+	/* Send n_req read16 requests */
 	int ret = ioctl(sg_fd, SG_IOSUBMIT, &ctl);
 	if (ret < 0 || (errno = ctl.spare_out)) {
 		perror("ioctl");
-		goto handle_err4;
+		goto handle_err3;
 	}
 
 	while (1) {
 		__sync_synchronize();
 		if (g_async_info.status < 0)
-			goto handle_err4;
+			goto handle_err3;
 	}
 
 	return 0;
 
-handle_err4:
-	free(req_arr);
 handle_err3:
 	free(req_arr);
 handle_err2:
@@ -254,11 +276,14 @@ int main(int argc, char *argv[])
 	}
 
 	struct capacity16 cap = { };
-	v4_read_capacity16(sg_fd, &cap);
+	if (v4_read_capacity16(sg_fd, &cap) < 0)
+		exit(EXIT_FAILURE);
+
 	dump_capacity16(&cap);
 
-	v4_async_demo(sg_fd, &cap, 64);
+	if (v4_async_demo(sg_fd, &cap, 64) < 0)
+		exit(EXIT_FAILURE);
 
 	close(sg_fd);
-	return 0;
+	exit(EXIT_SUCCESS);
 }

@@ -73,6 +73,7 @@ int main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 	printf_log("--- Testing READ CAPACITY (16) ---\n");
-	test_read_capacity16(argv[1]);
+	if(test_read_capacity16(argv[1]) < 0)
+		exit(EXIT_FAILURE);
 	exit(EXIT_SUCCESS);
 }
