@@ -127,7 +127,7 @@ handle_err0:
 
 struct async_info {
 	int 		 	 sg_fd;
-	int			 status;
+	volatile sig_atomic_t	 status;
 	struct capacity16	*cap;
 	struct sg_io_v4 	*ctl;
 } g_async_info;
@@ -171,7 +171,12 @@ void async_handler(int sig)
 	}
 
 	return;
+
+	sigset_t sigset;
 handle_err:
+	sigemptyset(&sigset);
+	sigaddset(&sigset, sig);
+	sigprocmask(SIG_BLOCK, &sigset, NULL);
 	g_async_info.status = -1;
 }
 
@@ -244,8 +249,7 @@ int v4_async_demo(int sg_fd, struct capacity16 *cap, int n_req)
 	}
 
 	while (1) {
-		__sync_synchronize();
-		if (g_async_info.status < 0)
+		if (g_async_info.status < 0) /* Declared volatile */
 			goto handle_err3;
 	}
 
